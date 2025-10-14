@@ -1,4 +1,4 @@
-# app.py
+# app.py (with deep-linking to matches)
 import io
 import re
 import csv
@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Callable
+from urllib.parse import quote
 
 import streamlit as st
 import pandas as pd
@@ -15,10 +16,13 @@ from bs4 import BeautifulSoup
 # Optional PDF support
 PDF_OK = False
 try:
-    from pdfminer.high_level import extract_text as pdf_extract_text
-    PDF_OK = True
+    from pdfminer_high_level import extract_text as _  # type: ignore
 except Exception:
-    PDF_OK = False
+    try:
+        from pdfminer.high_level import extract_text as pdf_extract_text  # type: ignore
+        PDF_OK = True
+    except Exception:
+        PDF_OK = False
 
 # -----------------------
 # SEC client (public data.sec.gov)
@@ -61,10 +65,6 @@ class SecClient:
 
     @st.cache_data(ttl=3600, show_spinner=False)
     def ticker_table_cached(_self_dummy: object) -> Dict[str, Dict]:
-        """
-        Cacheable method (note: takes dummy self for Streamlit cache).
-        Returns { 'AAPL': {'cik_str': 320193, 'title': 'Apple Inc.'}, ... }
-        """
         url = "https://www.sec.gov/files/company_tickers.json"
         data = requests.get(url, headers={"User-Agent": USER_AGENT_DEFAULT}).json()
         out = {}
@@ -84,14 +84,10 @@ class SecClient:
         return self._get(url).json()
 
     def _fetch_index_file(self, name: str) -> Dict:
-        # e.g., "CIK0000320193-index.json"
         url = f"{BASE}/submissions/{name}"
         return self._get(url).json()
 
     def list_filings(self, cik: int, forms: List[str], start_date: Optional[str], limit_per_company: int) -> List[Dict]:
-        """
-        Combine recent + historical index. Filter by forms, start_date. Sort newest first. Truncate to limit.
-        """
         sub = self.submissions(cik)
         recs: List[Dict] = []
 
@@ -100,17 +96,14 @@ class SecClient:
             for i in range(n):
                 recs.append({k: block[k][i] for k in block.keys()})
 
-        # recent
         recent = sub.get("filings", {}).get("recent", {})
         harvest(recent)
 
-        # historical
         for f in sub.get("filings", {}).get("files", []):
             idx = self._fetch_index_file(f["name"])
             hist = idx.get("filings", {}).get("recent", {})
             harvest(hist)
 
-        # filters
         forms_up = {f.upper().strip() for f in forms if f.strip()}
         if forms_up:
             recs = [r for r in recs if str(r.get("form", "")).upper().strip() in forms_up]
@@ -131,14 +124,9 @@ class SecClient:
         return f"https://www.sec.gov/Archives/edgar/data/{cik_no_zeros}/{self._acc_path(accession_number)}/{primary_document}"
 
     def download_primary(self, cik: int, accession_number: str, primary_document: str) -> Tuple[str, bytes, str]:
-        """
-        Returns (url, content_bytes, media_type_guess).
-        media_type_guess: 'html' | 'txt' | 'pdf' | 'bin'
-        """
         url = self.primary_url(cik, accession_number, primary_document)
         r = self._get(url, stream=True)
         content = r.content
-        # guess type by extension + sniff
         ext = primary_document.lower().rsplit(".", 1)[-1] if "." in primary_document else ""
         if ext in ("htm", "html", "xhtml"):
             mtype = "html"
@@ -156,7 +144,7 @@ class SecClient:
         return url, content, mtype
 
 # -----------------------
-# Text extraction & search
+# Text extraction & deep-links
 # -----------------------
 
 def bytes_to_text_html_or_txt(content: bytes, is_html: bool) -> str:
@@ -174,16 +162,40 @@ def bytes_to_text_html_or_txt(content: bytes, is_html: bool) -> str:
 def pdf_bytes_to_text(content: bytes) -> str:
     if not PDF_OK:
         return ""
+    from pdfminer.high_level import extract_text as pdf_extract_text  # lazy import
     with io.BytesIO(content) as bio:
         try:
             return pdf_extract_text(bio) or ""
         except Exception:
             return ""
 
+def make_text_fragment_url(base_url: str, full_text: str, start: int, end: int) -> str:
+    """Chrome/Edge: #:~:text=prefix-,exact,-suffix"""
+    exact = full_text[start:end]
+    prefix = full_text[max(0, start - 30):start]
+    suffix = full_text[end:end + 30]
+    # sanitize whitespace
+    exact = " ".join(exact.split())
+    prefix = " ".join(prefix.split())
+    suffix = " ".join(suffix.split())
+    frag = f"#:~:text={quote(prefix, safe='')}-," \
+           f"{quote(exact, safe='')}," \
+           f"-{quote(suffix, safe='')}"
+    return f"{base_url}{frag}"
+
+def make_pdf_search_url(base_url: str, term: str, full_text: str, start: int) -> str:
+    """Open PDF with search prefilled; add page=~ if we can estimate from form feed characters."""
+    page = None
+    try:
+        page = full_text[:start].count("\x0c") + 1  # pdfminer page breaks
+    except Exception:
+        page = None
+    frag = f"#search={quote(term)}"
+    if page and page > 0:
+        frag = f"#page={page}&search={quote(term)}"
+    return f"{base_url}{frag}"
+
 def find_matches(text: str, term: str, context: int = 80) -> List[Tuple[int, int, str]]:
-    """
-    Returns list of (start, end, snippet) for case-insensitive literal matches.
-    """
     matches = []
     if not text or not term:
         return matches
@@ -211,7 +223,6 @@ LIKELY_TERM_SHEETS = ["terms", "search", "keywords"]
 def load_input_excel(file_like, comp_sheet: Optional[str], term_sheet: Optional[str]) -> InputData:
     xls = pd.read_excel(file_like, sheet_name=None)
 
-    # companies sheet
     comp_df = None
     if comp_sheet and comp_sheet in xls:
         comp_df = xls[comp_sheet]
@@ -221,7 +232,7 @@ def load_input_excel(file_like, comp_sheet: Optional[str], term_sheet: Optional[
                 comp_df = xls[cand]
                 break
     if comp_df is None:
-        for name, df in xls.items():
+        for _, df in xls.items():
             cols = {str(c).strip().lower() for c in df.columns if isinstance(c, str)}
             if {"ticker", "cik"} & cols:
                 comp_df = df
@@ -235,7 +246,6 @@ def load_input_excel(file_like, comp_sheet: Optional[str], term_sheet: Optional[
         raise ValueError("Companies sheet must have 'ticker' or 'cik' column.")
     comp_df = comp_df.dropna(how="all").reset_index(drop=True)
 
-    # terms sheet
     term_df = None
     if term_sheet and term_sheet in xls:
         term_df = xls[term_sheet]
@@ -245,7 +255,7 @@ def load_input_excel(file_like, comp_sheet: Optional[str], term_sheet: Optional[
                 term_df = xls[cand]
                 break
     if term_df is None:
-        for name, df in xls.items():
+        for _, df in xls.items():
             cols = {str(c).strip().lower() for c in df.columns if isinstance(c, str)}
             if {"term", "search_term", "keyword"} & cols:
                 term_df = df
@@ -257,16 +267,12 @@ def load_input_excel(file_like, comp_sheet: Optional[str], term_sheet: Optional[
     term_df.columns = [str(c).strip().lower() for c in term_df.columns]
     term_col = "term" if "term" in term_df.columns else ("search_term" if "search_term" in term_df.columns else "keyword")
     terms = [str(t).strip() for t in term_df[term_col].dropna().tolist() if str(t).strip()]
-
     if not terms:
         raise ValueError("No search terms found in the terms sheet.")
 
     return InputData(companies=comp_df, terms=terms)
 
 def manual_companies_to_df(items: List[str], ticker_cache: Dict[str, Dict]) -> pd.DataFrame:
-    """
-    Accepts tickers or CIKs; returns DataFrame with columns: ticker, cik, company.
-    """
     rows = []
     for raw in items:
         s = raw.strip()
@@ -296,7 +302,7 @@ def manual_companies_to_df(items: List[str], ticker_cache: Dict[str, Dict]) -> p
     return df.reset_index(drop=True)
 
 # -----------------------
-# Search runner
+# Search runner (now adds deep links)
 # -----------------------
 
 @dataclass
@@ -316,13 +322,8 @@ def run_search(
     ticker_cache: Dict[str, Dict],
     progress_cb: Optional[Callable[[int, int, str], None]] = None
 ) -> pd.DataFrame:
-    """
-    Returns a DataFrame of matches (one row per match).
-    progress_cb(step, total, message) can be provided to update UI.
-    """
     forms = [f.strip() for f in cfg.forms_csv.split(",") if f.strip()]
 
-    # normalize companies
     cdf = companies_df.copy()
     cdf.columns = [str(c).strip().lower() for c in cdf.columns]
     if "ticker" not in cdf.columns:
@@ -415,6 +416,14 @@ def run_search(
                 if not matches:
                     continue
                 for mi, (spos, epos, snip) in enumerate(matches, start=1):
+                    # Build deep link
+                    if mtype in ("html", "txt"):
+                        open_at = make_text_fragment_url(url, text, spos, epos)
+                    elif mtype == "pdf":
+                        open_at = make_pdf_search_url(url, term, text, spos)
+                    else:
+                        open_at = url  # fallback
+
                     out_rows.append({
                         "company": name or "",
                         "ticker": ticker or "",
@@ -424,7 +433,9 @@ def run_search(
                         "reportDate": f.get("reportDate", ""),
                         "accessionNumber": acc,
                         "primaryDocument": prim,
-                        "doc_url": url,
+                        "doc_url": url,              # raw document
+                        "open_at_match": open_at,    # deep link
+                        "open_doc": url,             # convenience
                         "term": term,
                         "match_index": mi,
                         "char_start": spos,
@@ -457,8 +468,8 @@ with st.sidebar:
     rps = st.number_input("Requests per second (politeness)", 1.0, 10.0, 4.0, 0.5)
     user_agent = st.text_input("User-Agent (include contact email)", USER_AGENT_DEFAULT)
     first_match_only = st.checkbox("Only first match per filing & term", value=False)
-    pdf_note = "✅ PDF supported" if PDF_OK else "⚠️ PDF search disabled (install pdfminer.six)"
-    st.caption(pdf_note)
+    st.caption("Deep links: Chrome/Edge jump to highlighted text; PDFs open with search prefilled."
+               + (" PDFs supported." if PDF_OK else " PDF search disabled (install pdfminer.six)."))
 
 tab1, tab2 = st.tabs(["Quick Search (no Excel)", "From Excel"])
 
@@ -467,7 +478,6 @@ with tab1:
     st.subheader("Quick Search")
     companies_csv = st.text_input("Companies (tickers or CIKs, comma-separated)", "AAPL,MSFT")
     terms_csv = st.text_input("Search terms (comma-separated)", "climate risk,cybersecurity")
-
     run_quick = st.button("Run Quick Search", type="primary", use_container_width=True)
 
 # --- From Excel ---
@@ -498,6 +508,35 @@ def progress_cb_factory(container):
         status.write(message)
     return cb
 
+def render_results(df: pd.DataFrame):
+    if df.empty:
+        st.info("No matches found for the current filters/terms.")
+        return
+    # Show as interactive table with clickable links
+    cols = {
+        "company": "Company",
+        "ticker": "Ticker",
+        "form": "Form",
+        "filingDate": "Filing date",
+        "term": "Term",
+        "snippet": "Snippet",
+        "open_at_match": st.column_config.LinkColumn("Open at match"),
+        "open_doc": st.column_config.LinkColumn("Open filing"),
+    }
+    st.dataframe(
+        df[list(cols.keys())],
+        use_container_width=True,
+        hide_index=True,
+        column_config=cols
+    )
+    st.download_button(
+        "Download CSV",
+        df.to_csv(index=False),
+        file_name="edgar_matches.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
 def do_search_with_inputs(companies_df: pd.DataFrame, terms: List[str], trigger_label: str):
     if not ensure_user_agent_ok(user_agent):
         st.warning("Please include contact info (e.g., an email) in your User-Agent per SEC guidance.")
@@ -509,28 +548,15 @@ def do_search_with_inputs(companies_df: pd.DataFrame, terms: List[str], trigger_
         user_agent=user_agent.strip() or USER_AGENT_DEFAULT,
         first_match_only=bool(first_match_only),
     )
-
     spot = st.container()
     cb = progress_cb_factory(spot)
     with st.spinner(f"Running {trigger_label}…"):
         df = run_search(client, companies_df, terms, cfg, ticker_cache, progress_cb=cb)
-
     st.success(f"Done — {len(df)} matches.")
-    if len(df):
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download CSV",
-            df.to_csv(index=False),
-            file_name="edgar_matches.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
-    else:
-        st.info("No matches found for the current filters/terms.")
+    render_results(df)
 
 # Handle Quick Search action
 if run_quick:
-    # Parse companies
     manual_companies = [x.strip() for x in (companies_csv or "").split(",") if x.strip()]
     if not manual_companies:
         st.error("Enter at least one ticker or CIK.")
@@ -540,8 +566,6 @@ if run_quick:
         except Exception as e:
             st.error(f"Could not resolve manual companies: {e}")
             st.stop()
-
-        # Parse terms
         terms = [t.strip() for t in (terms_csv or "").split(",") if t.strip()]
         if not terms:
             st.error("Enter at least one search term.")
