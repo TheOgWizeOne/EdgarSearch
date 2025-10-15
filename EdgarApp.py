@@ -454,9 +454,9 @@ def run_search(
 # Streamlit UI
 # -----------------------
 
-st.set_page_config(page_title="SEC EDGAR Term Finder", page_icon="📄", layout="wide")
+st.set_page_config(page_title="SEC Document Search Tool", page_icon="📄", layout="wide")
 
-st.title("📄 SEC EDGAR Term Finder")
+st.title("📄 SEC Document Search Tool")
 st.caption("Search primary documents in recent/historical filings via the public data.sec.gov endpoints. "
            "Use a descriptive User-Agent with contact info and reasonable rate limits.")
 
