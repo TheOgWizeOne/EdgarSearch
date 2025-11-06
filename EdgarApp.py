@@ -236,40 +236,61 @@ def _find_all_spans(text: str, phrase: str, context: int, token_starts: List[int
     return spans
 
 # Tokenizer supports: WORD/PHRASE, AND, OR, (, ), NEAR/n, WITHIN/n
+
 def _tokenize_bool(q: str) -> List[str]:
-    tokens = []
+    tokens: List[str] = []
     i, n = 0, len(q)
     WHSP = set(" \t\r\n")
+
     while i < n:
         c = q[i]
+
+        # skip whitespace
         if c in WHSP:
-            i += 1; continue
+            i += 1
+            continue
+
+        # parens
         if c in "()":
-            tokens.append(c); i += 1; continue
+            tokens.append(c)
+            i += 1
+            continue
+
+        # quoted phrase
         if c == '"':
-            j = i + 1; buf = []
+            j = i + 1
+            buf: List[str] = []
             while j < n and q[j] != '"':
-                buf.append(q[j]); j += 1
+                buf.append(q[j])
+                j += 1
             if j >= n:
+                # unclosed quote: accept the rest as a phrase
                 tokens.append('"' + "".join(buf))
                 i = n
             else:
-                tokens.append('"' + "".join(buf) + '"'); i = j + 1
+                tokens.append('"' + "".join(buf) + '"')
+                i = j + 1
             continue
-        # NEAR/num or WITHIN/num
-        if q[i:].upper().startswith("NEAR/") or q[i:].upper().startswith("WITHIN/"):
+
+        # NEAR/num or WITHIN/num (consume contiguous non-space/non-paren)
+        upper_tail = q[i:].upper()
+        if upper_tail.startswith("NEAR/") or upper_tail.startswith("WITHIN/"):
             k = i
-            while k < n and q[k] not in WHSP + set("()"):
+            while k < n and (q[k] not in WHSP) and (q[k] not in "()"):
                 k += 1
             tokens.append(q[i:k])
             i = k
             continue
-        # word
+
+        # bare word/term (until space or paren or quote)
         j = i
-        while j < n and q[j] not in WHSP and q[j] not in '()"':
+        while j < n and (q[j] not in WHSP) and (q[j] not in '()"'):
             j += 1
-        tokens.append(q[i:j]); i = j
+        tokens.append(q[i:j])
+        i = j
+
     return tokens
+
 
 # AST with precedence: Proximity > AND > OR
 class Node: 
