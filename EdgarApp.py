@@ -1,17 +1,18 @@
-# app.py — SEC EDGAR Term Finder with Regex + AND/Proximity + Deep Links
+# app.py — SEC EDGAR Term Finder (with Boolean queries + deep links)
 import io
 import re
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Callable
+from pathlib import Path
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 from urllib.parse import quote
 
-import streamlit as st
 import pandas as pd
 import requests
+import streamlit as st
 from bs4 import BeautifulSoup
 
-# -------- Optional PDF support --------
+# Optional PDF support
 PDF_OK = False
 try:
     from pdfminer.high_level import extract_text as pdf_extract_text  # type: ignore
@@ -19,7 +20,10 @@ try:
 except Exception:
     PDF_OK = False
 
-# -------- SEC client --------
+# -----------------------
+# SEC client (public data.sec.gov)
+# -----------------------
+
 USER_AGENT_DEFAULT = "Your Name your.email@example.com (EDGAR research; Streamlit app)"
 BASE = "https://data.sec.gov"
 
@@ -57,6 +61,9 @@ class SecClient:
 
     @st.cache_data(ttl=3600, show_spinner=False)
     def ticker_table_cached(_self_dummy: object) -> Dict[str, Dict]:
+        """
+        Returns { 'AAPL': {'cik_str': 320193, 'title': 'Apple Inc.'}, ... }
+        """
         url = "https://www.sec.gov/files/company_tickers.json"
         data = requests.get(url, headers={"User-Agent": USER_AGENT_DEFAULT}).json()
         out = {}
@@ -76,10 +83,14 @@ class SecClient:
         return self._get(url).json()
 
     def _fetch_index_file(self, name: str) -> Dict:
+        # e.g., "CIK0000320193-index.json"
         url = f"{BASE}/submissions/{name}"
         return self._get(url).json()
 
     def list_filings(self, cik: int, forms: List[str], start_date: Optional[str], limit_per_company: int) -> List[Dict]:
+        """
+        Combine recent + historical index. Filter by forms, start_date. Sort newest first. Truncate to limit.
+        """
         sub = self.submissions(cik)
         recs: List[Dict] = []
 
@@ -88,13 +99,17 @@ class SecClient:
             for i in range(n):
                 recs.append({k: block[k][i] for k in block.keys()})
 
+        # recent
         recent = sub.get("filings", {}).get("recent", {})
         harvest(recent)
+
+        # historical
         for f in sub.get("filings", {}).get("files", []):
             idx = self._fetch_index_file(f["name"])
             hist = idx.get("filings", {}).get("recent", {})
             harvest(hist)
 
+        # filters
         forms_up = {f.upper().strip() for f in forms if f.strip()}
         if forms_up:
             recs = [r for r in recs if str(r.get("form", "")).upper().strip() in forms_up]
@@ -114,10 +129,14 @@ class SecClient:
         cik_no_zeros = str(int(cik))
         return f"https://www.sec.gov/Archives/edgar/data/{cik_no_zeros}/{self._acc_path(accession_number)}/{primary_document}"
 
-    def download_primary(self, cik: int, accession_number: str, primary_document: str):
+    def download_primary(self, cik: int, accession_number: str, primary_document: str) -> Tuple[str, bytes, str]:
+        """
+        Returns (url, content_bytes, media_type_guess) where media_type_guess ∈ {'html','txt','pdf','bin'}.
+        """
         url = self.primary_url(cik, accession_number, primary_document)
         r = self._get(url, stream=True)
         content = r.content
+        # guess type by extension + sniff
         ext = primary_document.lower().rsplit(".", 1)[-1] if "." in primary_document else ""
         if ext in ("htm", "html", "xhtml"):
             mtype = "html"
@@ -134,12 +153,15 @@ class SecClient:
                 mtype = "txt"
         return url, content, mtype
 
-# -------- Text extraction & links --------
-def html_txt_bytes_to_text(b: bytes, is_html: bool) -> str:
+# -----------------------
+# Text extraction & deep-link helpers
+# -----------------------
+
+def bytes_to_text_html_or_txt(content: bytes, is_html: bool) -> str:
     try:
-        txt = b.decode("utf-8", errors="ignore")
+        txt = content.decode("utf-8", errors="ignore")
     except Exception:
-        txt = b.decode("latin-1", errors="ignore")
+        txt = content.decode("latin-1", errors="ignore")
     if is_html:
         soup = BeautifulSoup(txt, "html.parser")
         for t in soup(["script", "style"]):
@@ -147,167 +169,197 @@ def html_txt_bytes_to_text(b: bytes, is_html: bool) -> str:
         return soup.get_text(separator=" ")
     return txt
 
-def pdf_bytes_to_text(b: bytes) -> str:
+def pdf_bytes_to_text(content: bytes) -> str:
     if not PDF_OK:
         return ""
-    with io.BytesIO(b) as bio:
+    with io.BytesIO(content) as bio:
         try:
             return pdf_extract_text(bio) or ""
         except Exception:
             return ""
 
 def make_text_fragment_url(base_url: str, full_text: str, start: int, end: int) -> str:
-    exact = " ".join(full_text[start:end].split())
-    prefix = " ".join(full_text[max(0, start-30):start].split())
-    suffix = " ".join(full_text[end:end+30].split())
-    frag = f"#:~:text={quote(prefix, safe='')}-," \
-           f"{quote(exact, safe='')}," \
-           f"-{quote(suffix, safe='')}"
+    """Chrome/Edge: #:~:text=prefix-,exact,-suffix"""
+    exact = full_text[start:end]
+    prefix = full_text[max(0, start - 30):start]
+    suffix = full_text[end:end + 30]
+    exact = " ".join(exact.split()); prefix = " ".join(prefix.split()); suffix = " ".join(suffix.split())
+    frag = f"#:~:text={quote(prefix, safe='')}-,{quote(exact, safe='')},-{quote(suffix, safe='')}"
     return f"{base_url}{frag}"
 
-def make_pdf_search_url(base_url: str, term_for_searchbox: str, full_text: str, start: int) -> str:
+def make_pdf_search_url(base_url: str, term_for_viewer: str, full_text: str, start: int) -> str:
+    """Open PDF with search prefilled; add page hint if we can estimate from pdfminer page breaks."""
     page = None
     try:
         page = full_text[:start].count("\x0c") + 1  # pdfminer page breaks
     except Exception:
-        pass
+        page = None
+    frag = f"#search={quote(term_for_viewer)}"
     if page and page > 0:
-        return f"{base_url}#page={page}&search={quote(term_for_searchbox)}"
-    return f"{base_url}#search={quote(term_for_searchbox)}"
+        frag = f"#page={page}&search={quote(term_for_viewer)}"
+    return f"{base_url}{frag}"
 
-# -------- Matching helpers (Literal / Regex / AND+Proximity) --------
-def matches_literal(text: str, term: str, context_chars: int = 80) -> List[Tuple[int, int, str, str]]:
-    out = []
+def find_matches(text: str, term: str, context: int = 80) -> List[Tuple[int, int, str]]:
+    matches = []
     if not text or not term:
-        return out
+        return matches
     pat = re.compile(re.escape(term), re.IGNORECASE)
     for m in pat.finditer(text):
         s, e = m.start(), m.end()
-        left, right = max(0, s-context_chars), min(len(text), e+context_chars)
+        left = max(0, s - context); right = min(len(text), e + context)
         snippet = text[left:right].replace("\n", " ").replace("\r", " ")
-        out.append((s, e, snippet, term))
-    return out
+        matches.append((s, e, snippet))
+    return matches
 
-def matches_regex(text: str, pattern: str, context_chars: int = 80, case_insensitive: bool = True, dotall: bool = True) -> List[Tuple[int, int, str, str]]:
-    out = []
-    if not text or not pattern:
-        return out
-    flags = 0
-    if case_insensitive: flags |= re.IGNORECASE
-    if dotall: flags |= re.DOTALL
-    rx = re.compile(pattern, flags)
-    for m in rx.finditer(text):
+# -----------------------
+# Boolean query engine (AND / OR / parentheses / quoted phrases)
+# -----------------------
+
+class Span(NamedTuple):
+    start: int
+    end: int
+    snippet: str
+
+class BoolResult(NamedTuple):
+    matched: bool
+    span: Optional[Span]  # first useful span to jump to, if any
+
+def _normalize_ws(s: str) -> str:
+    return " ".join(s.split())
+
+def _find_all_spans(text: str, phrase: str, context: int = 80) -> List[Span]:
+    pat = re.compile(re.escape(phrase), re.IGNORECASE)
+    spans: List[Span] = []
+    for m in pat.finditer(text):
         s, e = m.start(), m.end()
-        left, right = max(0, s-context_chars), min(len(text), e+context_chars)
+        left = max(0, s - context); right = min(len(text), e + context)
         snippet = text[left:right].replace("\n", " ").replace("\r", " ")
-        out.append((s, e, snippet, m.group(0)))
-    return out
+        spans.append(Span(s, e, snippet))
+    return spans
 
-def tokenize_words_with_spans(text: str) -> Tuple[List[str], List[Tuple[int,int]]]:
-    # Simple word tokenizer: sequences of letters/digits/underscore
-    spans = []
-    words = []
-    for m in re.finditer(r"\b\w+\b", text):
-        spans.append((m.start(), m.end()))
-        words.append(text[m.start():m.end()])
-    return words, spans
+def _tokenize_bool(q: str) -> List[str]:
+    tokens = []
+    i = 0; n = len(q)
+    WHSP = set(" \t\r\n")
+    while i < n:
+        c = q[i]
+        if c in WHSP:
+            i += 1; continue
+        if c in "()":
+            tokens.append(c); i += 1; continue
+        if c == '"':  # quoted phrase
+            j = i + 1; buf = []
+            while j < n and q[j] != '"':
+                buf.append(q[j]); j += 1
+            if j >= n:
+                tokens.append('"' + "".join(buf))  # unclosed; accept
+                i = n
+            else:
+                tokens.append('"' + "".join(buf) + '"')
+                i = j + 1
+            continue
+        j = i
+        while j < n and q[j] not in WHSP and q[j] not in '()"':
+            j += 1
+        tokens.append(q[i:j])
+        i = j
+    return tokens
 
-def find_phrase_occurrences(text_lower: str, phrase_lower: str) -> List[int]:
-    """Return start char indices for every occurrence of 'phrase_lower' in 'text_lower'."""
-    out = []
-    start = 0
-    while True:
-        i = text_lower.find(phrase_lower, start)
-        if i == -1:
-            break
-        out.append(i)
-        start = i + 1
-    return out
+class Node:
+    def eval(self, spans_map: Dict[str, List[Span]]) -> BoolResult: ...
 
-def char_index_to_word_index(char_index: int, word_spans: List[Tuple[int,int]]) -> int:
-    # Binary search for the word whose start is <= char_index < end (or nearest following)
-    lo, hi = 0, len(word_spans)-1
-    best = 0
-    while lo <= hi:
-        mid = (lo+hi)//2
-        s, e = word_spans[mid]
-        if s <= char_index < e:
-            return mid
-        if char_index < s:
-            hi = mid - 1
+class Phrase(Node):
+    def __init__(self, phrase: str):
+        self.phrase = phrase
+    def eval(self, spans_map: Dict[str, List[Span]]) -> BoolResult:
+        lst = spans_map.get(self.phrase.lower(), [])
+        return BoolResult(bool(lst), lst[0] if lst else None)
+
+class And(Node):
+    def __init__(self, left: Node, right: Node):
+        self.left = left; self.right = right
+    def eval(self, spans_map: Dict[str, List[Span]]) -> BoolResult:
+        l = self.left.eval(spans_map)
+        if not l.matched: return BoolResult(False, None)
+        r = self.right.eval(spans_map)
+        if not r.matched: return BoolResult(False, None)
+        # earliest span for jump
+        candidates = [s for s in [l.span, r.span] if s]
+        span = sorted(candidates, key=lambda s: s.start)[0] if candidates else None
+        return BoolResult(True, span)
+
+class Or(Node):
+    def __init__(self, left: Node, right: Node):
+        self.left = left; self.right = right
+    def eval(self, spans_map: Dict[str, List[Span]]) -> BoolResult:
+        l = self.left.eval(spans_map)
+        r = self.right.eval(spans_map)
+        if not l.matched and not r.matched:
+            return BoolResult(False, None)
+        candidates = [s for s in [l.span, r.span] if s]
+        span = sorted(candidates, key=lambda s: s.start)[0] if candidates else None
+        return BoolResult(True, span)
+
+def _parse_boolean(tokens: List[str]) -> Node:
+    pos = 0
+    def peek():
+        return tokens[pos] if pos < len(tokens) else None
+    def eat(tok=None):
+        nonlocal pos
+        t = peek()
+        if t is None: return None
+        if tok is None or t.upper() == tok or t == tok:
+            pos += 1; return t
+        return None
+    def parse_expr() -> Node:
+        node = parse_term()
+        while True:
+            t = peek()
+            if t and t.upper() == "OR":
+                eat(); node = Or(node, parse_term())
+            else:
+                break
+        return node
+    def parse_term() -> Node:
+        node = parse_factor()
+        while True:
+            t = peek()
+            if t and t.upper() == "AND":
+                eat(); node = And(node, parse_factor())
+            else:
+                break
+        return node
+    def parse_factor() -> Node:
+        t = peek()
+        if t == "(":
+            eat("("); node = parse_expr(); eat(")"); return node
+        if t and len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+            eat(); return Phrase(_normalize_ws(t[1:-1]))
+        if t:
+            eat(); return Phrase(_normalize_ws(t))
+        return Phrase("")  # empty
+    return parse_expr()
+
+def evaluate_boolean_query(text: str, query: str) -> BoolResult:
+    toks = _tokenize_bool(query)
+    # collect unique leaves
+    phrases: List[str] = []
+    for t in toks:
+        if t in ("(", ")", "AND", "and", "OR", "or"):
+            continue
+        if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+            phrases.append(_normalize_ws(t[1:-1]).lower())
         else:
-            best = mid
-            lo = mid + 1
-    return best
+            phrases.append(_normalize_ws(t).lower())
+    unique = sorted(set(p for p in phrases if p))
+    spans_map = {p: _find_all_spans(text, p) for p in unique}
+    ast = _parse_boolean(toks)
+    return ast.eval(spans_map)
 
-def matches_and_proximity(text: str, terms: List[str], window_words: int = 40, context_chars: int = 100) -> List[Tuple[int,int,str,str]]:
-    """
-    Return spans where ALL terms occur within a window of <= window_words.
-    We locate a minimal covering window across the token sequence, then project to char spans.
-    """
-    out = []
-    if not text or not terms:
-        return out
-    terms_l = [t.strip().lower() for t in terms if t.strip()]
-    if not terms_l:
-        return out
+# -----------------------
+# Excel + manual inputs
+# -----------------------
 
-    text_l = text.lower()
-    words, spans = tokenize_words_with_spans(text_l)
-    if not words:
-        return out
-
-    # For each term/phrase, map to list of word positions where the phrase starts
-    term_pos_lists: List[List[int]] = []
-    for t in terms_l:
-        char_starts = find_phrase_occurrences(text_l, t)
-        if not char_starts:
-            return out  # if any term missing, no AND match
-        wpos = [char_index_to_word_index(cs, spans) for cs in char_starts]
-        term_pos_lists.append(wpos)
-
-    # Multi-pointer sweep to find minimal windows covering all terms
-    # Flatten (pos, term_id) pairs
-    pairs = []
-    for tid, lst in enumerate(term_pos_lists):
-        pairs += [(p, tid) for p in lst]
-    pairs.sort()
-
-    from collections import defaultdict, deque
-    need = len(term_pos_lists)
-    count: Dict[int,int] = defaultdict(int)
-    have = 0
-    q = deque()  # sliding window over pairs
-    best_windows: List[Tuple[int,int]] = []
-
-    for p, tid in pairs:
-        q.append((p, tid))
-        if count[tid] == 0:
-            have += 1
-        count[tid] += 1
-        # shrink from left while we still cover all terms
-        while q and have == need:
-            left_p, left_tid = q[0]
-            right_p = q[-1][0]
-            if right_p - left_p <= max(1, window_words):
-                best_windows.append((left_p, right_p))
-            # pop left
-            count[left_tid] -= 1
-            if count[left_tid] == 0:
-                have -= 1
-            q.popleft()
-
-    # Turn each window into a char span + snippet
-    for wp_l, wp_r in best_windows:
-        s_char = spans[wp_l][0]
-        e_char = spans[min(wp_r, len(spans)-1)][1]
-        left, right = max(0, s_char - context_chars), min(len(text), e_char + context_chars)
-        snippet = text[left:right].replace("\n", " ").replace("\r", " ")
-        label = " AND ".join(terms) + f" (≤{window_words} words)"
-        out.append((s_char, e_char, snippet, label))
-    return out
-
-# -------- Excel + manual helpers --------
 @dataclass
 class InputData:
     companies: pd.DataFrame
@@ -318,61 +370,84 @@ LIKELY_TERM_SHEETS = ["terms", "search", "keywords"]
 
 def load_input_excel(file_like, comp_sheet: Optional[str], term_sheet: Optional[str]) -> InputData:
     xls = pd.read_excel(file_like, sheet_name=None)
+
+    # companies sheet
     comp_df = None
     if comp_sheet and comp_sheet in xls:
         comp_df = xls[comp_sheet]
     else:
         for cand in LIKELY_COMP_SHEETS:
-            if cand in xls: comp_df = xls[cand]; break
+            if cand in xls:
+                comp_df = xls[cand]
+                break
     if comp_df is None:
         for _, df in xls.items():
             cols = {str(c).strip().lower() for c in df.columns if isinstance(c, str)}
-            if {"ticker", "cik"} & cols: comp_df = df; break
+            if {"ticker", "cik"} & cols:
+                comp_df = df
+                break
     if comp_df is None:
         raise ValueError("Could not find a companies sheet (needs 'ticker' or 'cik').")
+
     comp_df = comp_df.copy()
     comp_df.columns = [str(c).strip().lower() for c in comp_df.columns]
     if "ticker" not in comp_df.columns and "cik" not in comp_df.columns:
         raise ValueError("Companies sheet must have 'ticker' or 'cik' column.")
     comp_df = comp_df.dropna(how="all").reset_index(drop=True)
 
+    # terms sheet
     term_df = None
     if term_sheet and term_sheet in xls:
         term_df = xls[term_sheet]
     else:
         for cand in LIKELY_TERM_SHEETS:
-            if cand in xls: term_df = xls[cand]; break
+            if cand in xls:
+                term_df = xls[cand]
+                break
     if term_df is None:
         for _, df in xls.items():
             cols = {str(c).strip().lower() for c in df.columns if isinstance(c, str)}
-            if {"term", "search_term", "keyword"} & cols: term_df = df; break
+            if {"term", "search_term", "keyword"} & cols:
+                term_df = df
+                break
     if term_df is None:
         raise ValueError("Could not find a terms sheet (needs 'term' or 'search_term' or 'keyword').")
+
     term_df = term_df.copy()
     term_df.columns = [str(c).strip().lower() for c in term_df.columns]
     term_col = "term" if "term" in term_df.columns else ("search_term" if "search_term" in term_df.columns else "keyword")
     terms = [str(t).strip() for t in term_df[term_col].dropna().tolist() if str(t).strip()]
+
     if not terms:
         raise ValueError("No search terms found in the terms sheet.")
+
     return InputData(companies=comp_df, terms=terms)
 
 def manual_companies_to_df(items: List[str], ticker_cache: Dict[str, Dict]) -> pd.DataFrame:
+    """
+    Accepts tickers or CIKs; returns DataFrame with columns: ticker, cik, company.
+    """
     rows = []
     for raw in items:
         s = raw.strip()
-        if not s: continue
+        if not s:
+            continue
         if s.isdigit():
             cik = int(s)
             ticker_guess, title = "", ""
             for t, rec in ticker_cache.items():
                 if int(rec["cik_str"]) == cik:
-                    ticker_guess = t; title = rec.get("title", ""); break
+                    ticker_guess = t
+                    title = rec.get("title", "")
+                    break
             rows.append({"ticker": ticker_guess, "cik": cik, "company": title})
         else:
             ticker = s.upper()
             rec = ticker_cache.get(ticker)
             if rec:
                 rows.append({"ticker": ticker, "cik": int(rec["cik_str"]), "company": rec.get("title", "")})
+            else:
+                rows.append({"ticker": ticker, "cik": None, "company": ""})
     df = pd.DataFrame(rows)
     df = df[df["cik"].notna()].copy()
     if df.empty:
@@ -380,7 +455,10 @@ def manual_companies_to_df(items: List[str], ticker_cache: Dict[str, Dict]) -> p
     df["cik"] = df["cik"].astype(int)
     return df.reset_index(drop=True)
 
-# -------- Runner --------
+# -----------------------
+# Search runner
+# -----------------------
+
 @dataclass
 class SearchConfig:
     forms_csv: str
@@ -389,36 +467,38 @@ class SearchConfig:
     rps: float
     user_agent: str
     first_match_only: bool
-    mode: str  # 'literal' | 'regex' | 'andprox'
-    regex_pattern: str
-    and_terms: List[str]
-    prox_window_words: int
-    case_insensitive: bool
-    regex_dotall: bool
 
 def run_search(
     client: SecClient,
     companies_df: pd.DataFrame,
-    # For literal/regex: a single "terms" list; For AND/Prox: use cfg.and_terms
-    terms_for_literal_or_regex: List[str],
+    terms: List[str],
     cfg: SearchConfig,
     ticker_cache: Dict[str, Dict],
-    progress_cb: Optional[Callable[[int, int, str], None]] = None
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    boolean_query: Optional[str] = None,  # NEW
 ) -> pd.DataFrame:
-
+    """
+    Returns a DataFrame of matches (one row per match or per document in boolean mode).
+    """
     forms = [f.strip() for f in cfg.forms_csv.split(",") if f.strip()]
 
+    # normalize companies
     cdf = companies_df.copy()
     cdf.columns = [str(c).strip().lower() for c in cdf.columns]
-    if "ticker" not in cdf.columns: cdf["ticker"] = ""
-    if "company" not in cdf.columns and "title" in cdf.columns: cdf["company"] = cdf["title"]
-    if "company" not in cdf.columns: cdf["company"] = ""
+    if "ticker" not in cdf.columns:
+        cdf["ticker"] = ""
+    if "company" not in cdf.columns and "title" in cdf.columns:
+        cdf["company"] = cdf["title"]
+    if "company" not in cdf.columns:
+        cdf["company"] = ""
 
     out_rows: List[Dict] = []
     total_steps = max(1, int(len(cdf) * max(1, cfg.limit_per_company)))
     step = 0
+
     def pb(step, msg):
-        if progress_cb: progress_cb(step, total_steps, msg)
+        if progress_cb:
+            progress_cb(step, total_steps, msg)
 
     for _, row in cdf.iterrows():
         ticker = str(row.get("ticker") or "").strip() or None
@@ -436,10 +516,14 @@ def run_search(
         if not ticker and cik:
             for t, rec in ticker_cache.items():
                 if int(rec["cik_str"]) == int(cik):
-                    ticker = t; name = name or rec.get("title", ""); break
+                    ticker = t
+                    name = name or rec.get("title", "")
+                    break
 
         if not cik:
-            step += 1; pb(step, f"[{ticker or 'UNKNOWN'}] Skipping: cannot resolve CIK."); continue
+            step += 1
+            pb(step, f"[{ticker or 'UNKNOWN'}] Skipping: cannot resolve CIK.")
+            continue
 
         pb(step, f"[{ticker or cik}] Listing filings…")
         try:
@@ -450,103 +534,124 @@ def run_search(
                 limit_per_company=cfg.limit_per_company
             )
         except Exception as e:
-            step += 1; pb(step, f"[{ticker or cik}] ERROR listing filings: {e}"); continue
+            step += 1
+            pb(step, f"[{ticker or cik}] ERROR listing filings: {e}")
+            continue
 
         if not filings:
-            step += 1; pb(step, f"[{ticker or cik}] No filings found with filters."); continue
+            step += 1
+            pb(step, f"[{ticker or cik}] No filings found with filters.")
+            continue
 
         for f in filings:
-            acc = f.get("accessionNumber"); prim = f.get("primaryDocument")
-            if not acc or not prim: continue
+            acc = f.get("accessionNumber")
+            prim = f.get("primaryDocument")
+            if not acc or not prim:
+                continue
+
             try:
                 url, content, mtype = client.download_primary(cik, acc, prim)
             except Exception as e:
                 pb(step, f"[{ticker or cik}] ERROR downloading {acc}/{prim}: {e}")
                 continue
 
-            # Extract text
+            # extract text
             if mtype in ("html", "txt"):
-                text = html_txt_bytes_to_text(content, is_html=(mtype == "html"))
+                text = bytes_to_text_html_or_txt(content, is_html=(mtype == "html"))
             elif mtype == "pdf":
                 text = pdf_bytes_to_text(content) if PDF_OK else ""
             else:
-                try: text = content.decode("utf-8", errors="ignore")
-                except Exception: text = ""
+                try:
+                    text = content.decode("utf-8", errors="ignore")
+                except Exception:
+                    text = ""
 
             if not text:
                 pb(step, f"[{ticker or cik}] Empty/unreadable text for {acc}/{prim}")
                 continue
 
-            # Run chosen matcher
-            doc_matches: List[Tuple[int,int,str,str]] = []
-            if cfg.mode == "literal":
-                for term in terms_for_literal_or_regex:
-                    doc_matches += matches_literal(text, term, context_chars=100)
-            elif cfg.mode == "regex":
-                # Single pattern; if user pasted multiple, we OR them with |
-                pattern = cfg.regex_pattern.strip()
-                if not pattern and terms_for_literal_or_regex:
-                    pattern = "|".join(re.escape(t) for t in terms_for_literal_or_regex)
-                doc_matches = matches_regex(
-                    text, pattern,
-                    context_chars=120,
-                    case_insensitive=cfg.case_insensitive,
-                    dotall=cfg.regex_dotall
-                )
-            else:  # AND + Proximity
-                doc_matches = matches_and_proximity(
-                    text, cfg.and_terms,
-                    window_words=max(1, int(cfg.prox_window_words)),
-                    context_chars=120
-                )
-
-            if not doc_matches:  # continue to next filing
-                continue
-
-            # Emit rows (respect first_match_only)
-            emitted = 0
-            for mi, (spos, epos, snip, label) in enumerate(doc_matches, start=1):
-                # Build deep links
-                if mtype in ("html", "txt"):
-                    open_at = make_text_fragment_url(url, text, spos, epos)
-                elif mtype == "pdf":
-                    # For PDFs we prefill the search with the best available label (exact/regex match text)
-                    open_at = make_pdf_search_url(url, label, text, spos)
-                else:
-                    open_at = url
-
-                out_rows.append({
-                    "company": name or "",
-                    "ticker": ticker or "",
-                    "cik": cik,
-                    "form": f.get("form", ""),
-                    "filingDate": f.get("filingDate", ""),
-                    "reportDate": f.get("reportDate", ""),
-                    "accessionNumber": acc,
-                    "primaryDocument": prim,
-                    "doc_url": url,
-                    "open_at_match": open_at,
-                    "open_doc": url,
-                    "query_mode": cfg.mode,
-                    "term_or_pattern": label if cfg.mode != "literal" else label,  # literal term OR matched text/label
-                    "match_index": mi,
-                    "char_start": spos,
-                    "char_end": epos,
-                    "snippet": snip,
-                })
-                emitted += 1
-                if cfg.first_match_only and emitted >= 1:
-                    break
+            if boolean_query:
+                # Boolean mode: evaluate once per document
+                br = evaluate_boolean_query(text, boolean_query)
+                if br.matched:
+                    if br.span:
+                        spos, epos, snip = br.span.start, br.span.end, br.span.snippet
+                        viewer_term = text[br.span.start:br.span.end]
+                    else:
+                        spos, epos, snip = 0, 0, text[:160].replace("\n", " ")
+                        viewer_term = boolean_query
+                    if mtype in ("html", "txt"):
+                        open_at = make_text_fragment_url(url, text, spos, epos)
+                    elif mtype == "pdf":
+                        open_at = make_pdf_search_url(url, viewer_term, text, spos)
+                    else:
+                        open_at = url
+                    out_rows.append({
+                        "company": name or "",
+                        "ticker": ticker or "",
+                        "cik": cik,
+                        "form": f.get("form", ""),
+                        "filingDate": f.get("filingDate", ""),
+                        "reportDate": f.get("reportDate", ""),
+                        "accessionNumber": acc,
+                        "primaryDocument": prim,
+                        "doc_url": url,
+                        "open_at_match": open_at,
+                        "open_doc": url,
+                        "term": boolean_query,
+                        "match_index": 1,
+                        "char_start": spos,
+                        "char_end": epos,
+                        "snippet": snip,
+                    })
+            else:
+                # Simple terms mode
+                for term in terms:
+                    matches = find_matches(text, term, context=80)
+                    if not matches:
+                        continue
+                    for mi, (spos, epos, snip) in enumerate(matches, start=1):
+                        if mtype in ("html", "txt"):
+                            open_at = make_text_fragment_url(url, text, spos, epos)
+                        elif mtype == "pdf":
+                            open_at = make_pdf_search_url(url, term, text, spos)
+                        else:
+                            open_at = url
+                        out_rows.append({
+                            "company": name or "",
+                            "ticker": ticker or "",
+                            "cik": cik,
+                            "form": f.get("form", ""),
+                            "filingDate": f.get("filingDate", ""),
+                            "reportDate": f.get("reportDate", ""),
+                            "accessionNumber": acc,
+                            "primaryDocument": prim,
+                            "doc_url": url,
+                            "open_at_match": open_at,
+                            "open_doc": url,
+                            "term": term,
+                            "match_index": mi,
+                            "char_start": spos,
+                            "char_end": epos,
+                            "snippet": snip,
+                        })
+                        if cfg.first_match_only:
+                            break
 
         step += 1
         pb(step, f"[{ticker or cik}] Done batch.")
 
     return pd.DataFrame(out_rows)
 
-# -------- UI --------
+# -----------------------
+# Streamlit UI
+# -----------------------
+
 st.set_page_config(page_title="SEC EDGAR Term Finder", page_icon="📄", layout="wide")
+
 st.title("📄 SEC EDGAR Term Finder")
-st.caption("Search primary documents in EDGAR filings. Include a descriptive User-Agent with contact info and keep rates modest (SEC fair access).")
+st.caption("Search primary documents in recent/historical filings via the public data.sec.gov endpoints. "
+           "Use a descriptive User-Agent with contact info and reasonable rate limits.")
 
 with st.sidebar:
     st.subheader("Options")
@@ -555,48 +660,47 @@ with st.sidebar:
     limit_per_company = st.number_input("Max filings per company", 1, 100, 5)
     rps = st.number_input("Requests per second (politeness)", 1.0, 10.0, 4.0, 0.5)
     user_agent = st.text_input("User-Agent (include contact email)", USER_AGENT_DEFAULT)
-    first_match_only = st.checkbox("Only first match per filing & term", value=False)
+    first_match_only = st.checkbox("Only first match per filing & term (terms mode)", value=False)
 
     st.markdown("---")
-    st.subheader("Query mode")
-    mode = st.radio("Choose", ["Exact (literal)", "Regex", "Advanced (AND + proximity)"], index=0)
-
-    case_ins = True
-    dotall = True
-    regex_pattern = ""
-    and_terms_list: List[str] = []
-    prox_window_words = 40
-
-    if mode == "Regex":
-        regex_pattern = st.text_input("Regex pattern (Python `re`)", "")
-        case_ins = st.checkbox("Case-insensitive", value=True)
-        dotall = st.checkbox("Dot matches newline (DOTALL)", value=True)
-        st.caption("Tip: Leave pattern empty and also fill 'Search terms' to OR them automatically.")
-    elif mode == "Advanced (AND + proximity)":
-        prox_window_words = st.number_input("Proximity window (words)", 1, 400, 40)
+    use_boolean = st.checkbox("Use Boolean query (AND / OR / parentheses)", value=False)
+    bool_query = ""
+    if use_boolean:
+        st.caption(
+            'Use AND / OR and parentheses. Quote phrases for exact matches.\n'
+            'Example:\n("artificial intelligence" OR "machine learning" OR "generative AI") '
+            'AND (incident OR error OR failure OR risk OR loss)'
+        )
+        bool_query = st.text_area(
+            "Boolean query",
+            height=100,
+            value='("artificial intelligence" OR "machine learning" OR "generative AI") AND (incident OR error)'
+        )
+    st.caption("PDF deep links show a prefilled search (page hint when available). "
+               + ("✅ PDF supported." if PDF_OK else "⚠️ PDF search disabled (install pdfminer.six)."))
 
 tab1, tab2 = st.tabs(["Quick Search (no Excel)", "From Excel"])
 
+# --- Quick Search ---
 with tab1:
     st.subheader("Quick Search")
     companies_csv = st.text_input("Companies (tickers or CIKs, comma-separated)", "AAPL,MSFT")
-    if mode == "Exact (literal)" or mode == "Regex":
+    if not use_boolean:
         terms_csv = st.text_input("Search terms (comma-separated)", "climate risk,cybersecurity")
-    else:
-        terms_csv = st.text_input("AND terms (comma-separated; all must appear)", "ai incident,model failure")
     run_quick = st.button("Run Quick Search", type="primary", use_container_width=True)
 
+# --- From Excel ---
 with tab2:
     st.subheader("Excel Upload")
     xfile = st.file_uploader("Upload Excel (.xlsx/.xlsm/.xls)", type=["xlsx", "xlsm", "xls"])
     c_sheet = st.text_input("Companies sheet name (optional)", "companies")
-    t_sheet = st.text_input("Terms sheet name (optional)", "terms")
+    t_sheet = st.text_input("Terms sheet name (optional)", "terms (ignored if Boolean mode)")
     run_excel = st.button("Run Excel Search", type="primary", use_container_width=True)
 
 # Shared ticker cache + client
 client = SecClient(user_agent=user_agent or USER_AGENT_DEFAULT, rps=float(rps))
 try:
-    ticker_cache = SecClient.ticker_table_cached(client)
+    ticker_cache = SecClient.ticker_table_cached(client)  # cached
 except Exception as e:
     st.error(f"Failed to load SEC ticker table: {e}")
     st.stop()
@@ -615,20 +719,24 @@ def progress_cb_factory(container):
 
 def render_results(df: pd.DataFrame):
     if df.empty:
-        st.info("No matches found for the current filters/terms.")
+        st.info("No matches found for the current filters/query.")
         return
     cols = {
         "company": "Company",
         "ticker": "Ticker",
         "form": "Form",
         "filingDate": "Filing date",
-        "query_mode": "Mode",
-        "term_or_pattern": "Matched term/pattern",
+        "term": "Term / Query",
         "snippet": "Snippet",
         "open_at_match": st.column_config.LinkColumn("Open at match"),
         "open_doc": st.column_config.LinkColumn("Open filing"),
     }
-    st.dataframe(df[list(cols.keys())], use_container_width=True, hide_index=True, column_config=cols)
+    st.dataframe(
+        df[list(cols.keys())],
+        use_container_width=True,
+        hide_index=True,
+        column_config=cols
+    )
     st.download_button(
         "Download CSV",
         df.to_csv(index=False),
@@ -637,13 +745,9 @@ def render_results(df: pd.DataFrame):
         use_container_width=True
     )
 
-def do_search(companies_df: pd.DataFrame, raw_terms_csv: str, trigger: str):
+def do_search_with_inputs(companies_df: pd.DataFrame, terms: List[str], trigger_label: str):
     if not ensure_user_agent_ok(user_agent):
         st.warning("Please include contact info (e.g., an email) in your User-Agent per SEC guidance.")
-
-    # Parse terms field according to mode
-    terms_list = [t.strip() for t in (raw_terms_csv or "").split(",") if t.strip()]
-    and_terms = terms_list if mode == "Advanced (AND + proximity)" else []
     cfg = SearchConfig(
         forms_csv=forms_csv,
         start_date=start_date,
@@ -651,25 +755,19 @@ def do_search(companies_df: pd.DataFrame, raw_terms_csv: str, trigger: str):
         rps=float(rps),
         user_agent=user_agent.strip() or USER_AGENT_DEFAULT,
         first_match_only=bool(first_match_only),
-        mode=("literal" if mode == "Exact (literal)" else "regex" if mode == "Regex" else "andprox"),
-        regex_pattern=regex_pattern,
-        and_terms=and_terms,
-        prox_window_words=int(prox_window_words),
-        case_insensitive=case_ins,
-        regex_dotall=dotall,
     )
-
-    # For literal/regex we pass the list; for AND we pass an empty list (handled via cfg.and_terms)
-    pass_terms = [] if cfg.mode == "andprox" else terms_list
-
     spot = st.container()
     cb = progress_cb_factory(spot)
-    with st.spinner(f"Running {trigger}…"):
-        df = run_search(client, companies_df, pass_terms, cfg, ticker_cache, progress_cb=cb)
-    st.success(f"Done — {len(df)} matches.")
+    with st.spinner(f"Running {trigger_label}…"):
+        df = run_search(
+            client, companies_df, terms, cfg, ticker_cache,
+            progress_cb=cb,
+            boolean_query=(bool_query.strip() if use_boolean else None)
+        )
+    st.success(f"Done — {len(df)} match{'es' if len(df)!=1 else ''}.")
     render_results(df)
 
-# Handle actions
+# Handle Quick Search action
 if run_quick:
     manual_companies = [x.strip() for x in (companies_csv or "").split(",") if x.strip()]
     if not manual_companies:
@@ -680,26 +778,28 @@ if run_quick:
         except Exception as e:
             st.error(f"Could not resolve manual companies: {e}")
             st.stop()
-        if mode == "Advanced (AND + proximity)":
-            if not terms_csv.strip():
-                st.error("Enter AND terms (comma-separated).")
+        if use_boolean:
+            terms = []  # ignored
+            if not bool_query.strip():
+                st.error("Enter a Boolean query.")
             else:
-                do_search(companies_df, terms_csv, "Quick Search")
+                do_search_with_inputs(companies_df, terms, "Quick Search (Boolean)")
         else:
-            if not terms_csv.strip() and not regex_pattern.strip():
-                st.error("Enter search terms or a regex pattern.")
+            terms = [t.strip() for t in (st.session_state.get("terms_csv", terms_csv) or "").split(",") if t.strip()]
+            if not terms:
+                st.error("Enter at least one search term.")
             else:
-                do_search(companies_df, terms_csv, "Quick Search")
+                do_search_with_inputs(companies_df, terms, "Quick Search")
 
+# Handle Excel action
 if run_excel:
     if not xfile:
         st.error("Please upload an Excel file.")
     else:
         try:
-            data = load_input_excel(xfile, c_sheet.strip() or None, t_sheet.strip() or None)
+            data = load_input_excel(xfile, c_sheet.strip() or None, (t_sheet.strip() or None) if not use_boolean else None)
         except Exception as e:
             st.error(f"Excel error: {e}")
             st.stop()
-        # Excel provides a list of terms (one per row) -> join for UI path
-        excel_terms_csv = ",".join(data.terms)
-        do_search(data.companies, excel_terms_csv, "Excel Search")
+        # In Boolean mode, terms are ignored even if present in Excel
+        do_search_with_inputs(data.companies, data.terms if not use_boolean else [], "Excel Search")
