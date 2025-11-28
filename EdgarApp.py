@@ -673,7 +673,7 @@ with st.sidebar:
     st.subheader("Options")
     forms_csv = st.text_input("Form types (comma-separated)", "10-K,10-Q,8-K")
     start_date = st.text_input("Start date (YYYY-MM-DD)", "")
-    limit_per_company = st.number_input("Max filings per company", 1, 100, 5)
+    limit_per_company = st.number_input("Max filings per company", 1, 100, 20)
     rps = st.number_input("Requests per second (politeness)", 1.0, 10.0, 4.0, 0.5)
     user_agent = st.text_input("User-Agent (include contact email)", USER_AGENT_DEFAULT)
     first_match_only = st.checkbox("Only first match per filing & term (terms mode)", value=False)
