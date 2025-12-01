@@ -1,4 +1,5 @@
-# app.py — SEC EDGAR Term Finder (Boolean + Proximity + Whole-word + Normalization + Deep links)
+# app.py — SEC EDGAR Term Finder
+# (Boolean + Proximity + Whole-word + Normalization + End date + Scan log)
 
 import io
 import re
@@ -12,7 +13,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# Optional PDF support (page text extraction and page hint)
+# Optional PDF support (page text extraction + page hint)
 PDF_OK = False
 try:
     from pdfminer.high_level import extract_text as pdf_extract_text  # type: ignore
@@ -61,9 +62,6 @@ class SecClient:
 
     @st.cache_data(ttl=3600, show_spinner=False)
     def ticker_table_cached(_self_dummy: object) -> Dict[str, Dict]:
-        """
-        Returns { 'AAPL': {'cik_str': 320193, 'title': 'Apple Inc.'}, ... }
-        """
         url = "https://www.sec.gov/files/company_tickers.json"
         data = requests.get(url, headers={"User-Agent": USER_AGENT_DEFAULT}).json()
         out = {}
@@ -86,7 +84,14 @@ class SecClient:
         url = f"{BASE}/submissions/{name}"
         return self._get(url).json()
 
-    def list_filings(self, cik: int, forms: List[str], start_date: Optional[str], limit_per_company: int) -> List[Dict]:
+    def list_filings(
+        self,
+        cik: int,
+        forms: List[str],
+        start_date: Optional[str],
+        limit_per_company: int,
+        end_date: Optional[str] = None,
+    ) -> List[Dict]:
         sub = self.submissions(cik)
         recs: List[Dict] = []
 
@@ -95,24 +100,22 @@ class SecClient:
             for i in range(n):
                 recs.append({k: block[k][i] for k in block.keys()})
 
-        # recent
-        recent = sub.get("filings", {}).get("recent", {})
-        harvest(recent)
-
-        # historical
+        # recent + historical
+        harvest(sub.get("filings", {}).get("recent", {}))
         for f in sub.get("filings", {}).get("files", []):
             idx = self._fetch_index_file(f["name"])
-            hist = idx.get("filings", {}).get("recent", {})
-            harvest(hist)
+            harvest(idx.get("filings", {}).get("recent", {}))
 
         # filters
         forms_up = {f.upper().strip() for f in forms if f.strip()}
         if forms_up:
             recs = [r for r in recs if str(r.get("form", "")).upper().strip() in forms_up]
         if start_date:
-            recs = [r for r in recs if r.get("filingDate", "") >= start_date]
+            recs = [r for r in recs if (r.get("filingDate", "") >= start_date)]
         if end_date:
             recs = [r for r in recs if (r.get("filingDate", "") <= end_date)]
+
+        # newest first
         recs.sort(key=lambda r: (r.get("filingDate", ""), r.get("accessionNumber", "")), reverse=True)
         if limit_per_company and limit_per_company > 0:
             recs = recs[:limit_per_company]
@@ -127,9 +130,6 @@ class SecClient:
         return f"https://www.sec.gov/Archives/edgar/data/{cik_no_zeros}/{self._acc_path(accession_number)}/{primary_document}"
 
     def download_primary(self, cik: int, accession_number: str, primary_document: str) -> Tuple[str, bytes, str]:
-        """
-        Returns (url, content_bytes, media_type_guess) where media_type_guess ∈ {'html','txt','pdf','bin'}.
-        """
         url = self.primary_url(cik, accession_number, primary_document)
         r = self._get(url, stream=True)
         content = r.content
@@ -175,28 +175,24 @@ def pdf_bytes_to_text(content: bytes) -> str:
         except Exception:
             return ""
 
-# Normalization to reduce false positives / Ctrl+F mismatches
+# Normalization (NBSPs, soft hyphens, PDF line-break hyphenation)
 def normalize_text_for_search(s: str, normalize: bool = True) -> str:
     if not normalize or not s:
         return s or ""
-    # Common culprits
-    s = s.replace("\u00a0", " ")  # NBSP -> space
-    s = s.replace("\u00ad", "")   # soft hyphen (invisible)
-    # Join words split by hyphen at end of line (PDFs)
-    s = re.sub(r"-\s*\n\s*", "", s)
-    # Collapse odd whitespace runs
-    s = re.sub(r"[ \t\r\f\v]+", " ", s)
+    s = s.replace("\u00a0", " ")      # NBSP -> space
+    s = s.replace("\u00ad", "")       # soft hyphen (invisible)
+    s = re.sub(r"-\s*\n\s*", "", s)   # join hyphenated line breaks (PDFs)
+    s = re.sub(r"[ \t\r\f\v]+", " ", s)  # collapse odd whitespace
     return s
 
 def make_text_fragment_from_exact(base_url: str, exact: str) -> str:
-    """Best-effort text fragment using only the exact snippet (more robust after normalization)."""
+    """Best-effort text fragment using only 'exact' (more robust after normalization)."""
     exact_clean = " ".join((exact or "").split())
     if not exact_clean:
         return base_url
     return f"{base_url}#:~:text={quote(exact_clean, safe='')}"
 
 def make_pdf_search_url(base_url: str, term_for_viewer: str, full_text_raw: str, char_start_guess: int) -> str:
-    """Open PDF with search prefilled; add page hint estimated from raw text page breaks (pdfminer)."""
     page = None
     try:
         page = full_text_raw[:char_start_guess].count("\x0c") + 1
@@ -214,7 +210,6 @@ def make_pdf_search_url(base_url: str, term_for_viewer: str, full_text_raw: str,
 def _build_pattern(phrase: str, whole_words: bool) -> re.Pattern:
     esc = re.escape(phrase)
     if whole_words:
-        # Word boundaries that are robust for mixed unicode word chars
         return re.compile(r"(?i)(?<!\w)" + esc + r"(?!\w)")
     return re.compile(r"(?i)" + esc)
 
@@ -507,7 +502,7 @@ def manual_companies_to_df(items: List[str], ticker_cache: Dict[str, Dict]) -> p
     return df.reset_index(drop=True)
 
 # -----------------------
-# Search runner
+# Search runner (returns matches_df, scan_log_df)
 # -----------------------
 
 @dataclass
@@ -530,7 +525,7 @@ def run_search(
     boolean_or_prox_query: Optional[str] = None,
     whole_words_only: bool = True,
     normalize_text_opt: bool = True,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     forms = [f.strip() for f in cfg.forms_csv.split(",") if f.strip()]
 
     cdf = companies_df.copy()
@@ -540,12 +535,30 @@ def run_search(
     if "company" not in cdf.columns: cdf["company"] = ""
 
     out_rows: List[Dict] = []
+    scan_rows: List[Dict] = []
+
     total_steps = max(1, int(len(cdf) * max(1, cfg.limit_per_company)))
     step = 0
 
     def pb(step, msg):
         if progress_cb:
             progress_cb(step, total_steps, msg)
+
+    def log_row(status: str, context: Dict = None):
+        row = {
+            "company": name or "",
+            "ticker": ticker or "",
+            "cik": cik,
+            "form": f.get("form", "") if isinstance(f, dict) else "",
+            "filingDate": f.get("filingDate", "") if isinstance(f, dict) else "",
+            "accessionNumber": f.get("accessionNumber", "") if isinstance(f, dict) else "",
+            "primaryDocument": f.get("primaryDocument", "") if isinstance(f, dict) else "",
+            "doc_url": url if 'url' in locals() else "",
+            "status": status,
+        }
+        if context:
+            row.update(context)
+        scan_rows.append(row)
 
     for _, row in cdf.iterrows():
         ticker = str(row.get("ticker") or "").strip() or None
@@ -566,28 +579,55 @@ def run_search(
                     ticker = t; name = name or rec.get("title", ""); break
 
         if not cik:
-            step += 1; pb(step, f"[{ticker or 'UNKNOWN'}] Skipping: cannot resolve CIK."); continue
+            step += 1; pb(step, f"[{ticker or 'UNKNOWN'}] Skipping: cannot resolve CIK.")
+            continue
 
         pb(step, f"[{ticker or cik}] Listing filings…")
         try:
             filings = client.list_filings(
-                cik=cik, forms=forms, start_date=cfg.start_date.strip() or None,
+                cik=cik,
+                forms=forms,
+                start_date=cfg.start_date.strip() or None,
+                end_date=cfg.end_date.strip() or None,
                 limit_per_company=cfg.limit_per_company
             )
         except Exception as e:
-            step += 1; pb(step, f"[{ticker or cik}] ERROR listing filings: {e}"); continue
+            step += 1; pb(step, f"[{ticker or cik}] ERROR listing filings: {e}")
+            # log listing error at "company" level
+            scan_rows.append({
+                "company": name or "", "ticker": ticker or "", "cik": cik,
+                "form": "", "filingDate": "", "accessionNumber": "", "primaryDocument": "",
+                "doc_url": "", "status": "error_list", "error": str(e)
+            })
+            continue
 
         if not filings:
-            step += 1; pb(step, f"[{ticker or cik}] No filings found with filters."); continue
+            step += 1; pb(step, f"[{ticker or cik}] No filings found with filters.")
+            continue
+
+        # queue log
+        for f in filings:
+            scan_rows.append({
+                "company": name or "", "ticker": ticker or "", "cik": cik,
+                "form": f.get("form", ""), "filingDate": f.get("filingDate", ""),
+                "accessionNumber": f.get("accessionNumber", ""), "primaryDocument": f.get("primaryDocument", ""),
+                "doc_url": client.primary_url(cik, f.get("accessionNumber",""), f.get("primaryDocument","")) if f.get("accessionNumber") and f.get("primaryDocument") else "",
+                "status": "queued"
+            })
 
         for f in filings:
             acc = f.get("accessionNumber"); prim = f.get("primaryDocument")
-            if not acc or not prim: continue
+            if not acc or not prim: 
+                continue
 
             try:
+                log_row("downloading")
                 url, content, mtype = client.download_primary(cik, acc, prim)
+                log_row("downloaded", {"doc_url": url})
             except Exception as e:
-                pb(step, f"[{ticker or cik}] ERROR downloading {acc}/{prim}: {e}"); continue
+                pb(step, f"[{ticker or cik}] ERROR downloading {acc}/{prim}: {e}")
+                log_row("error_download", {"error": str(e)})
+                continue
 
             # extract raw text
             if mtype in ("html", "txt"):
@@ -599,14 +639,18 @@ def run_search(
                 except Exception: raw_text = ""
 
             if not raw_text:
-                pb(step, f"[{ticker or cik}] Empty/unreadable text for {acc}/{prim}"); continue
+                pb(step, f"[{ticker or cik}] Empty/unreadable text for {acc}/{prim}")
+                log_row("empty_text")
+                continue
 
             # normalize for searching
             search_text = normalize_text_for_search(raw_text, normalize_text_opt)
 
+            matched_this = False
             if boolean_or_prox_query and boolean_or_prox_query.strip():
                 br = evaluate_query(search_text, boolean_or_prox_query, whole_words_only)
                 if br.matched:
+                    matched_this = True
                     if br.span:
                         spos, epos = br.span.start, br.span.end
                         snippet = br.span.snippet
@@ -617,7 +661,6 @@ def run_search(
                         snippet = search_text[:160].replace("\n", " ")
                         exact_for_link = boolean_or_prox_query
                         char_start_guess = 0
-                    # Build links
                     if mtype in ("html", "txt"):
                         open_at = make_text_fragment_from_exact(url, exact_for_link)
                     elif mtype == "pdf":
@@ -635,9 +678,12 @@ def run_search(
                     })
             else:
                 # simple terms mode
+                any_term_matched = False
                 for term in terms:
                     matches = find_matches(search_text, term, context=80, whole_words=whole_words_only)
-                    if not matches: continue
+                    if not matches:
+                        continue
+                    any_term_matched = True
                     for mi, (spos, epos, snippet) in enumerate(matches, start=1):
                         exact_for_link = search_text[spos:epos]
                         if mtype in ("html", "txt"):
@@ -655,11 +701,18 @@ def run_search(
                             "term": term, "match_index": mi,
                             "char_start": spos, "char_end": epos, "snippet": snippet,
                         })
-                        if cfg.first_match_only: break
+                        if cfg.first_match_only:
+                            break
+                matched_this = any_term_matched
 
-        step += 1; pb(step, f"[{ticker or cik}] Done batch.")
+            log_row("matched" if matched_this else "no_match")
 
-    return pd.DataFrame(out_rows)
+        step += 1
+        pb(step, f"[{ticker or cik}] Done batch.")
+
+    matches_df = pd.DataFrame(out_rows)
+    scan_df = pd.DataFrame(scan_rows)
+    return matches_df, scan_df
 
 # -----------------------
 # Streamlit UI
@@ -668,7 +721,7 @@ def run_search(
 st.set_page_config(page_title="SEC EDGAR Term Finder", page_icon="📄", layout="wide")
 
 st.title("📄 SEC EDGAR Term Finder")
-st.caption("Boolean AND/OR, parentheses, quoted phrases, and proximity NEAR/n (client-side over EDGAR documents). "
+st.caption("Boolean AND/OR, parentheses, quoted phrases, proximity NEAR/n (client-side over EDGAR documents). "
            "Include a User-Agent with contact info and keep RPS modest.")
 
 with st.sidebar:
@@ -676,7 +729,7 @@ with st.sidebar:
     forms_csv = st.text_input("Form types (comma-separated)", "10-K,10-Q,8-K")
     start_date = st.text_input("Start date (YYYY-MM-DD)", "")
     end_date = st.text_input("End date (YYYY-MM-DD)", "")
-    limit_per_company = st.number_input("Max filings per company", 1, 100, 20)
+    limit_per_company = st.number_input("Max filings per company", 1, 1000, 20)
     rps = st.number_input("Requests per second (politeness)", 1.0, 10.0, 4.0, 0.5)
     user_agent = st.text_input("User-Agent (include contact email)", USER_AGENT_DEFAULT)
     first_match_only = st.checkbox("Only first match per filing & term (terms mode)", value=False)
@@ -700,15 +753,18 @@ with st.sidebar:
     whole_words_only = st.checkbox("Match whole words only", value=True)
     normalize_text_opt = st.checkbox("Normalize spaces & PDF hyphenation", value=True)
 
-    st.caption("HTML/TXT deep links highlight text in Chrome/Edge; PDFs open with a prefilled search (page hint when available). "
-               + ("✅ PDF supported." if PDF_OK else "⚠️ PDF search disabled (install pdfminer.six)."))
+    st.markdown("---")
+    show_scan_log = st.checkbox("Show documents scanned", value=True)
+
+    st.caption("HTML/TXT deep links use text fragments (best in Chrome/Edge). PDFs open with a prefilled search "
+               + ("and page hint. ✅ PDF supported." if PDF_OK else " (enable by installing pdfminer.six)."))
 
 tab1, tab2 = st.tabs(["Quick Search (no Excel)", "From Excel"])
 
 # Quick Search
 with tab1:
     st.subheader("Quick Search")
-    companies_csv = st.text_input("Companies (tickers or CIKs, comma-separated)", "AAPL,MSFT")
+    companies_csv = st.text_input("Companies (tickers or CIKs, comma-separated)", "JPM,BAC,MSFT,AAPL")
     if not use_boolean:
         terms_csv = st.text_input("Search terms (comma-separated)", "climate risk,cybersecurity")
     run_quick = st.button("Run Quick Search", type="primary", use_container_width=True)
@@ -762,9 +818,38 @@ def render_results(df: pd.DataFrame):
         column_config=cols
     )
     st.download_button(
-        "Download CSV",
+        "Download matches CSV",
         df.to_csv(index=False),
         file_name="edgar_matches.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+def render_scan_log(scan_df: pd.DataFrame):
+    st.subheader("Documents scanned")
+    if scan_df.empty:
+        st.info("No documents were scanned (check filters).")
+        return
+    cols = {
+        "company": "Company",
+        "ticker": "Ticker",
+        "form": "Form",
+        "filingDate": "Filing date",
+        "accessionNumber": "Accession",
+        "primaryDocument": "Primary doc",
+        "doc_url": st.column_config.LinkColumn("Open filing"),
+        "status": "Status",
+    }
+    st.dataframe(
+        scan_df[list(cols.keys())],
+        use_container_width=True,
+        hide_index=True,
+        column_config=cols
+    )
+    st.download_button(
+        "Download scan log CSV",
+        scan_df.to_csv(index=False),
+        file_name="edgar_scan_log.csv",
         mime="text/csv",
         use_container_width=True
     )
@@ -773,25 +858,28 @@ def do_search_with_inputs(companies_df: pd.DataFrame, terms: List[str], label: s
     if not ensure_user_agent_ok(user_agent):
         st.warning("Please include contact info (e.g., an email) in your User-Agent per SEC guidance.")
     cfg = SearchConfig(
-        forms_csv=forms_csv, 
+        forms_csv=forms_csv,
         start_date=start_date,
         end_date=end_date,
-        limit_per_company=int(limit_per_company), rps=float(rps),
+        limit_per_company=int(limit_per_company),
+        rps=float(rps),
         user_agent=user_agent.strip() or USER_AGENT_DEFAULT,
         first_match_only=bool(first_match_only),
     )
     spot = st.container()
     cb = progress_cb_factory(spot)
     with st.spinner(f"Running {label}…"):
-        df = run_search(
+        matches_df, scan_df = run_search(
             client, companies_df, terms, cfg, ticker_cache,
             progress_cb=cb,
             boolean_or_prox_query=(bool_query.strip() if use_boolean else None),
             whole_words_only=whole_words_only,
             normalize_text_opt=normalize_text_opt,
         )
-    st.success(f"Done — {len(df)} match{'es' if len(df)!=1 else ''}.")
-    render_results(df)
+    st.success(f"Done — {len(matches_df)} match{'es' if len(matches_df)!=1 else ''}.")
+    render_results(matches_df)
+    if show_scan_log:
+        render_scan_log(scan_df)
 
 # Handle Quick Search
 if run_quick:
