@@ -111,7 +111,8 @@ class SecClient:
             recs = [r for r in recs if str(r.get("form", "")).upper().strip() in forms_up]
         if start_date:
             recs = [r for r in recs if r.get("filingDate", "") >= start_date]
-
+        if end_date:
+            recs = [r for r in recs if (r.get("filingDate", "") <= end_date)]
         recs.sort(key=lambda r: (r.get("filingDate", ""), r.get("accessionNumber", "")), reverse=True)
         if limit_per_company and limit_per_company > 0:
             recs = recs[:limit_per_company]
@@ -513,6 +514,7 @@ def manual_companies_to_df(items: List[str], ticker_cache: Dict[str, Dict]) -> p
 class SearchConfig:
     forms_csv: str
     start_date: str
+    end_date: str
     limit_per_company: int
     rps: float
     user_agent: str
@@ -673,6 +675,7 @@ with st.sidebar:
     st.subheader("Options")
     forms_csv = st.text_input("Form types (comma-separated)", "10-K,10-Q,8-K")
     start_date = st.text_input("Start date (YYYY-MM-DD)", "")
+    end_date = st.text_input("End date (YYYY-MM-DD)", "")
     limit_per_company = st.number_input("Max filings per company", 1, 100, 20)
     rps = st.number_input("Requests per second (politeness)", 1.0, 10.0, 4.0, 0.5)
     user_agent = st.text_input("User-Agent (include contact email)", USER_AGENT_DEFAULT)
@@ -770,7 +773,9 @@ def do_search_with_inputs(companies_df: pd.DataFrame, terms: List[str], label: s
     if not ensure_user_agent_ok(user_agent):
         st.warning("Please include contact info (e.g., an email) in your User-Agent per SEC guidance.")
     cfg = SearchConfig(
-        forms_csv=forms_csv, start_date=start_date,
+        forms_csv=forms_csv, 
+        start_date=start_date,
+        end_date=end_date,
         limit_per_company=int(limit_per_company), rps=float(rps),
         user_agent=user_agent.strip() or USER_AGENT_DEFAULT,
         first_match_only=bool(first_match_only),
